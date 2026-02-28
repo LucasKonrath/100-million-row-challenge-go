@@ -2,6 +2,14 @@
 
 This project is a Go implementation of the 100 million row challenge.
 
+## Fastest result
+![alt text](image.png)
+
+```
+lucasdamaceno@Lucass-MacBook-Pro 100-million-row-challenge-go % go run . process 
+Processed 51 unique paths to data/output.json
+Completed in 1.173604s
+```
 ## How to Run
 
 ### Prerequisites

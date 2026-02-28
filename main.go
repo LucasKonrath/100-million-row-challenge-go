@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,9 +41,21 @@ func main() {
 			os.Exit(1)
 		}
 	case "process":
+		f, err := os.Create("cpu.prof")
+		if err != nil {
+			fmt.Println("could not create CPU profile: ", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Println("could not start CPU profile: ", err)
+			os.Exit(1)
+		}
+		defer pprof.StopCPUProfile()
+
 		allocator := &sync.Pool{
 			New: func() interface{} {
-				return make(Result)
+				return newResult()
 			},
 		}
 		start := time.Now()

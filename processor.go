@@ -9,11 +9,62 @@ import (
 	"sort"
 	"strings"
 	"sync"
-
-	"github.com/edsrzf/mmap-go"
+	"unsafe"
 )
 
-type Result map[string]map[string]int
+const (
+	// FNV-1 64-bit constants from hash/fnv
+	offset64 = 14695981039346656037
+	prime64  = 1099511628211
+	// Power of 2 map size
+	numBuckets = 1 << 16
+)
+
+type MapItem struct {
+	path string
+	date string
+	count int
+}
+
+type Result struct {
+	items []MapItem
+}
+
+func newResult() *Result {
+	return &Result{
+		items: make([]MapItem, numBuckets),
+	}
+}
+
+func (r *Result) add(path string, date string) {
+	hash := uint64(offset64)
+	for i := 0; i < len(path); i++ {
+		hash ^= uint64(path[i])
+		hash *= prime64
+	}
+	for i := 0; i < len(date); i++ {
+		hash ^= uint64(date[i])
+		hash *= prime64
+	}
+
+	index := int(hash & uint64(numBuckets-1))
+	for {
+		if r.items[index].path == "" {
+			r.items[index].path = path
+			r.items[index].date = date
+			r.items[index].count = 1
+			return
+		}
+		if r.items[index].path == path && r.items[index].date == date {
+			r.items[index].count++
+			return
+		}
+		index++
+		if index >= numBuckets {
+			index = 0
+		}
+	}
+}
 
 func process(allocator *sync.Pool, inputPath, outputPath string) error {
 	file, err := os.Open(inputPath)
@@ -22,57 +73,65 @@ func process(allocator *sync.Pool, inputPath, outputPath string) error {
 	}
 	defer file.Close()
 
-	mmap, err := mmap.Map(file, mmap.RDONLY, 0)
+	mmapData, err := mmap(file)
 	if err != nil {
 		return err
 	}
-	defer mmap.Unmap()
+	defer munmap(mmapData)
 
 	numThreads := runtime.NumCPU()
-	chunkSize := len(mmap) / numThreads
+	chunkSize := len(mmapData) / numThreads
 
 	var boundaries []int
 	boundaries = append(boundaries, 0)
 
 	for i := 1; i < numThreads; i++ {
 		pos := i * chunkSize
-		for pos < len(mmap) && mmap[pos] != '\n' {
+		for pos < len(mmapData) && mmapData[pos] != '\n' {
 			pos++
 		}
-		if pos < len(mmap) {
+		if pos < len(mmapData) {
 			pos++
 		}
 		boundaries = append(boundaries, pos)
 	}
-	boundaries = append(boundaries, len(mmap))
+	boundaries = append(boundaries, len(mmapData))
 
 	var wg sync.WaitGroup
-	results := make(chan Result, numThreads)
+	results := make(chan *Result, numThreads)
 
 	for i := 0; i < numThreads; i++ {
 		wg.Add(1)
 		go func(chunk []byte) {
 			defer wg.Done()
 			results <- processChunk(allocator, chunk)
-		}(mmap[boundaries[i]:boundaries[i+1]])
+		}(mmapData[boundaries[i]:boundaries[i+1]])
 	}
 
 	wg.Wait()
 	close(results)
 
-	merged := allocator.Get().(Result)
+	merged := allocator.Get().(*Result)
 	defer allocator.Put(merged)
 
 	for result := range results {
 		mergeMaps(merged, result)
 		// Clear the map before putting it back to the pool
-		for k := range result {
-			delete(result, k)
+		for i := range result.items {
+			result.items[i].path = ""
 		}
 		allocator.Put(result)
 	}
 
-	fmt.Printf("Processed %d unique paths to %s\n", len(merged), outputPath)
+	// Count unique paths for logging
+	uniquePaths := make(map[string]bool)
+	for _, item := range merged.items {
+		if item.path != "" {
+			uniquePaths[item.path] = true
+		}
+	}
+
+	fmt.Printf("Processed %d unique paths to %s\n", len(uniquePaths), outputPath)
 
 	jsonData, err := formatJSONConcurrently(merged)
 	if err != nil {
@@ -82,80 +141,92 @@ func process(allocator *sync.Pool, inputPath, outputPath string) error {
 	return os.WriteFile(outputPath, jsonData, 0644)
 }
 
-func processChunk(allocator *sync.Pool, chunk []byte) Result {
-	result := allocator.Get().(Result)
+func processChunk(allocator *sync.Pool, chunk []byte) *Result {
+	result := allocator.Get().(*Result)
+
 	start := 0
 	for start < len(chunk) {
 		end := bytes.IndexByte(chunk[start:], '\n')
-		var line []byte
 		if end == -1 {
-			line = chunk[start:]
-			start = len(chunk)
-		} else {
-			line = chunk[start : start+end]
+			break
+		}
+
+		// Line format: https://stitcher.io<path>,YYYY-MM-DDTHH:MM:SS+00:00\n
+		// "https://stitcher.io" is 19 bytes.
+		// "YYYY-MM-DDTHH:MM:SS+00:00" is 25 bytes.
+		// "," is 1 byte.
+		// Total fixed bytes per line = 19 (url prefix) + 1 (comma) + 25 (date) = 45 bytes
+		
+		if end < 45 {
 			start += end + 1
-		}
-
-		if len(line) == 0 {
 			continue
 		}
 
-		path, date, ok := parseLine(line)
-		if !ok {
-			continue
-		}
+		pathLen := end - 45
+		
+		pathBytes := chunk[start+19 : start+19+pathLen]
+		dateBytes := chunk[start+end-25 : start+end-15]
 
-		if _, ok := result[path]; !ok {
-			result[path] = make(map[string]int)
-		}
-		result[path][date]++
+		path := unsafe.String(unsafe.SliceData(pathBytes), pathLen)
+		date := unsafe.String(unsafe.SliceData(dateBytes), 10)
+
+		result.add(path, date)
+		
+		start += end + 1
 	}
 	return result
 }
 
-func parseLine(line []byte) (string, string, bool) {
-	commaPos := bytes.LastIndexByte(line, ',')
-	if commaPos == -1 {
-		return "", "", false
-	}
+func mergeMaps(dest, src *Result) {
+	for _, item := range src.items {
+		if item.path != "" {
+			// Fast path for merging: directly add multiple counts
+			
+			hash := uint64(offset64)
+			for i := 0; i < len(item.path); i++ {
+				hash ^= uint64(item.path[i])
+				hash *= prime64
+			}
+			for i := 0; i < len(item.date); i++ {
+				hash ^= uint64(item.date[i])
+				hash *= prime64
+			}
 
-	url := line[:commaPos]
-	datetime := line[commaPos+1:]
-
-	schemeEnd := bytes.Index(url, []byte("://"))
-	if schemeEnd == -1 {
-		return "", "", false
-	}
-
-	afterScheme := url[schemeEnd+3:]
-	pathStart := bytes.IndexByte(afterScheme, '/')
-	if pathStart == -1 {
-		return "", "", false
-	}
-
-	path := afterScheme[pathStart:]
-
-	if len(datetime) < 10 {
-		return "", "", false
-	}
-
-	return string(path), string(datetime[:10]), true
-}
-
-func mergeMaps(dest, src Result) {
-	for path, dateMap := range src {
-		if _, ok := dest[path]; !ok {
-			dest[path] = make(map[string]int)
-		}
-		for date, count := range dateMap {
-			dest[path][date] += count
+			index := int(hash & uint64(numBuckets-1))
+			for {
+				if dest.items[index].path == "" {
+					dest.items[index].path = item.path
+					dest.items[index].date = item.date
+					dest.items[index].count = item.count
+					break
+				}
+				if dest.items[index].path == item.path && dest.items[index].date == item.date {
+					dest.items[index].count += item.count
+					break
+				}
+				index++
+				if index >= numBuckets {
+					index = 0
+				}
+			}
 		}
 	}
 }
 
-func formatJSONConcurrently(result Result) ([]byte, error) {
-	paths := make([]string, 0, len(result))
-	for path := range result {
+func formatJSONConcurrently(result *Result) ([]byte, error) {
+	// Rebuild a standard map structure to use the existing JSON formatting logic easily
+	standardResult := make(map[string]map[string]int)
+	for _, item := range result.items {
+		if item.path != "" {
+			if _, ok := standardResult[item.path]; !ok {
+				standardResult[item.path] = make(map[string]int)
+			}
+			standardResult[item.path][item.date] += item.count
+		}
+	}
+
+	paths := make([]string, 0, len(standardResult))
+	for path := range standardResult {
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
@@ -170,7 +241,7 @@ func formatJSONConcurrently(result Result) ([]byte, error) {
 			var builder strings.Builder
 			builder.WriteString(fmt.Sprintf("    \"%s\": {\n", strings.ReplaceAll(p, "/", "\\/")))
 
-			dateMap := result[p]
+			dateMap := standardResult[p]
 			dates := make([]string, 0, len(dateMap))
 			for date := range dateMap {
 				dates = append(dates, date)
